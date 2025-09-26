@@ -1,34 +1,231 @@
-# Gradle files
-.gradle/
-build/
+# Trading Journal App with Firebase Cloud Sync (Flutter)
 
-# Local configuration file (sdk path, etc)
-local.properties
+This version extends the project by adding **Firebase Authentication + Cloud Firestore Sync** so users can log in and access trades across devices.
 
-# Log/OS Files
-*.log
+---
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
+## pubspec.yaml (dependencies)
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  sqflite: ^2.3.0
+  path_provider: ^2.1.0
+  intl: ^0.19.0
+  csv: ^6.0.0
+  fl_chart: ^0.68.0
+  firebase_core: ^2.24.2
+  firebase_auth: ^4.16.0
+  cloud_firestore: ^4.15.0
+  google_sign_in: ^6.2.1
+```
 
-# IntelliJ
-*.iml
-.idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
+---
 
-# Keystore files
-*.jks
-*.keystore
+## Firebase Setup (one-time)
+1. Go to [Firebase Console](https://console.firebase.google.com/).
+2. Create project → Add Android app → add package name `com.example.trading_journal`.
+3. Download `google-services.json` into `/android/app/`.
+4. In `android/build.gradle` and `app/build.gradle` integrate Firebase SDK (as per docs).
+5. Enable **Authentication → Google Sign-In** in Firebase console.
+6. Enable **Cloud Firestore**.
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
+---
 
-# Android Profiling
-*.hprof
+## lib/main.dart (updated with Firebase)
+```dart
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+
+import 'local_db.dart';
+import 'models.dart';
+import 'analytics.dart';
+import 'add_trade.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  runApp(const TradingJournalApp());
+}
+
+class TradingJournalApp extends StatelessWidget {
+  const TradingJournalApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Trading Journal',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const AuthGate(),
+    );
+  }
+}
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  Future<User?> _signInWithGoogle() async {
+    final GoogleSignInAccount? gUser = await GoogleSignIn().signIn();
+    final GoogleSignInAuthentication gAuth = await gUser!.authentication;
+    final credential = GoogleAuthProvider.credential(
+      accessToken: gAuth.accessToken,
+      idToken: gAuth.idToken,
+    );
+    return (await FirebaseAuth.instance.signInWithCredential(credential)).user;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (!snapshot.hasData) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('Sign In')),
+            body: Center(
+              child: ElevatedButton.icon(
+                icon: const Icon(Icons.login),
+                label: const Text('Sign in with Google'),
+                onPressed: _signInWithGoogle,
+              ),
+            ),
+          );
+        }
+        return const TradeListPage();
+      },
+    );
+  }
+}
+
+class TradeListPage extends StatefulWidget {
+  const TradeListPage({super.key});
+
+  @override
+  State<TradeListPage> createState() => _TradeListPageState();
+}
+
+class _TradeListPageState extends State<TradeListPage> {
+  @override
+  Widget build(BuildContext context) {
+    final user = FirebaseAuth.instance.currentUser!;
+    final tradesRef = FirebaseFirestore.instance.collection('users').doc(user.uid).collection('trades');
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Trading Journal'), actions: [
+        IconButton(
+          icon: const Icon(Icons.analytics),
+          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AnalyticsPage())),
+        ),
+        IconButton(
+          icon: const Icon(Icons.logout),
+          onPressed: () async => await FirebaseAuth.instance.signOut(),
+        ),
+      ]),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: tradesRef.orderBy('date', descending: true).snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+          final docs = snapshot.data!.docs;
+          if (docs.isEmpty) return const Center(child: Text('No trades yet'));
+          return ListView(
+            children: docs.map((d) {
+              final data = d.data() as Map<String, dynamic>;
+              final pnl = (data['exit'] - data['entry']) * data['size'];
+              return ListTile(
+                title: Text(data['pair']),
+                subtitle: Text('Entry: ${data['entry']}, Exit: ${data['exit']}, Size: ${data['size']}'),
+                trailing: Text(pnl.toStringAsFixed(2), style: TextStyle(color: pnl >= 0 ? Colors.green : Colors.red)),
+              );
+            }).toList(),
+          );
+        },
+      ),
+      floatingActionButton: FloatingActionButton(
+        child: const Icon(Icons.add),
+        onPressed: () async {
+          final result = await Navigator.push(context, MaterialPageRoute(builder: (_) => AddTradePage(tradesRef: tradesRef)));
+          if (result == true && context.mounted) setState(() {});
+        },
+      ),
+    );
+  }
+}
+```
+
+---
+
+## lib/add_trade.dart
+```dart
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+class AddTradePage extends StatefulWidget {
+  final CollectionReference tradesRef;
+  const AddTradePage({super.key, required this.tradesRef});
+
+  @override
+  State<AddTradePage> createState() => _AddTradePageState();
+}
+
+class _AddTradePageState extends State<AddTradePage> {
+  final _formKey = GlobalKey<FormState>();
+  final _pairController = TextEditingController();
+  final _entryController = TextEditingController();
+  final _exitController = TextEditingController();
+  final _sizeController = TextEditingController();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Add Trade')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: Column(children: [
+            TextFormField(controller: _pairController, decoration: const InputDecoration(labelText: 'Pair')),
+            TextFormField(controller: _entryController, decoration: const InputDecoration(labelText: 'Entry Price'), keyboardType: TextInputType.number),
+            TextFormField(controller: _exitController, decoration: const InputDecoration(labelText: 'Exit Price'), keyboardType: TextInputType.number),
+            TextFormField(controller: _sizeController, decoration: const InputDecoration(labelText: 'Size'), keyboardType: TextInputType.number),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () async {
+                if (_formKey.currentState!.validate()) {
+                  await widget.tradesRef.add({
+                    'pair': _pairController.text,
+                    'entry': double.parse(_entryController.text),
+                    'exit': double.parse(_exitController.text),
+                    'size': double.parse(_sizeController.text),
+                    'date': DateTime.now().toIso8601String(),
+                  });
+                  if (context.mounted) Navigator.pop(context, true);
+                }
+              },
+              child: const Text('Save'),
+            )
+          ]),
+        ),
+      ),
+    );
+  }
+}
+```
+
+---
+
+## Next Steps
+- Connect Firebase project (download `google-services.json`).
+- Run `flutter pub get`.
+- Test Google Sign-In → add trades → verify in Firebase Firestore console.
+
+---
+
+✅ Step 3 (Firebase Cloud Sync) added. Next, I can guide you on **Step 4 → APK Build & Play Store Publishing**.
+
+
